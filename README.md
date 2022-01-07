@@ -14,7 +14,7 @@ This PowerShell script can be used to extract user credentials (currently only N
 
 ## Usage
 
-Load the module `Invoke-LSAParse` in a PowerShell session, e.g. via `Import-Module .\Invoke-LSAParse.ps1`, and execute it using the two parameters `DMPFile` (full path to LSA dump file) and `verbose` (show additional information).
+Load the module `Invoke-LSAParse` in a PowerShell session, e.g. via `Import-Module .\Invoke-LSAParse.ps1`, and execute it using the two parameters `PathToDMP` (absolute path of LSA dump file) and `verbose` (show additional information).
 
 ![Example Execution](./example.gif)
 
