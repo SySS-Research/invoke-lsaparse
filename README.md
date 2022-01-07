@@ -1,6 +1,6 @@
 # Invoke-LSAParse
 
-PowerShell implemtation for parsing LSA (Local Security Authority) memory dumps.
+PowerShell implementation for parsing LSA (Local Security Authority) memory dumps.
 
 This PowerShell script can be used to extract user credentials (currently only NT hashes) from LSA memory dump files. Its only dependency is the executable of the [Microsoft Console Debugger (cdb.exe)](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugger-download-tools) which is integrated into the PowerShell code by using the corresponding build script.
 
@@ -35,6 +35,8 @@ The current version of `Invoke-LSAParse` has the following limitations:
 * Only Windows 10 LSASS process memory dumps are reliably supported.
 * Extracting cleartext passwords is currently not supported.
 
+## Author
+Sebastian Hölzle, SySS GmbH, 2021
 
 ## Disclaimer
 
