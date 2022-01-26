@@ -4,6 +4,7 @@ PowerShell implementation for parsing LSA (Local Security Authority) memory dump
 
 This PowerShell script can be used to extract user credentials (currently only NT hashes) from LSA memory dump files. Its only dependency is the executable of the [Microsoft Console Debugger (cdb.exe)](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugger-download-tools) which is integrated into the PowerShell code by using the corresponding build script.
 
+A tech blog article titled [Extracting Secrets from LSA by Use of PowerShell](https://blog.syss.com/posts/powershell-lsa-parsing/) about the problem of parsing LSA process memory dumps can be found on the [SySS Tech Blog](https://blog.syss.com/).
 
 ## Installation
 
@@ -11,13 +12,11 @@ This PowerShell script can be used to extract user credentials (currently only N
 1. Download the [Microsoft Console Debugger](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugger-download-tools) and copy the executable file `cdb.exe` to the `Invoke-LSAParse` directory
 1. Call the PowerShell build script `.\build.ps1` to create the actual `Invoke-LSAParse.ps1` PowerShell script
 
-
 ## Usage
 
 Load the module `Invoke-LSAParse` in a PowerShell session, e.g. via `Import-Module .\Invoke-LSAParse.ps1`, and execute it using the two parameters `PathToDMP` (absolute path of LSA dump file) and `verbose` (show additional information).
 
 ![Example Execution](./example.gif)
-
 
 ## Mode of operation
 
@@ -26,7 +25,6 @@ Load the module `Invoke-LSAParse` in a PowerShell session, e.g. via `Import-Modu
 After those memory addresses are known, the data structures containing cryptographic data and encrypted user credentials are parsed using PowerShell code.
 
 Currently, `Invoke-LSAParse` only outputs the NT hashes of logged-in users or identities.
-
 
 ## Limitations
 
